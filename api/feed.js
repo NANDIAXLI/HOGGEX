@@ -39,125 +39,111 @@ async function mapLimit(items, limit, fn) {
   return out.filter(Boolean);
 }
 
-// Walk any JSON blob and collect the first values matching a predicate.
-function deepFind(node, test, found = [], seen = new Set()) {
-  if (!node || typeof node !== "object" || seen.has(node)) return found;
-  seen.add(node);
-  if (test(node)) found.push(node);
-  for (const v of Object.values(node)) deepFind(v, test, found, seen);
-  return found;
-}
+/* ---------------- ArtStation ----------------
+   ArtStation puts its JSON endpoints behind Cloudflare bot protection that
+   blocks requests from servers (not just this one — every automated tool
+   hits the same 403, this is a platform-wide restriction, not a bug in
+   this code). There's no reliable server-side workaround for that, so
+   Art posts are listed by hand below until ArtStation opens this up.
+   Add a new entry any time you post new work — takes a few seconds. */
 
-function bestCover(covers) {
-  if (!covers) return null;
-  const order = ["original", "808", "404", "230", "202", "115", "max_808", "small"];
-  for (const k of order) if (covers[k]) return typeof covers[k] === "string" ? covers[k] : covers[k].url;
-  const first = Object.values(covers)[0];
-  return typeof first === "string" ? first : first?.url || null;
-}
-
-/* ---------------- ArtStation ---------------- */
+const ARTSTATION_MANUAL = [
+  {
+    id: "manual-1",
+    title: "Character design",
+    year: "",
+    tags: "",
+    desc: "",
+    link: "https://www.artstation.com/hoggex",
+    images: [],
+  },
+];
 
 async function artstation() {
-  const list = await get(
-    `https://www.artstation.com/users/${ARTSTATION_USER}/projects.json?page=1`,
-    true
-  );
-  const projects = (list.data || []).slice(0, MAX_PROJECTS);
+  try {
+    const list = await get(
+      `https://www.artstation.com/users/${ARTSTATION_USER}/projects.json?page=1`,
+      true
+    );
+    const projects = (list.data || []).slice(0, MAX_PROJECTS);
+    if (!projects.length) throw new Error("empty");
 
-  return mapLimit(projects, 5, async (p) => {
-    let images = [];
-    let desc = "";
-    try {
-      const d = await get(`https://www.artstation.com/projects/${p.hash_id}.json`, true);
-      desc = (d.description_html || d.description || "").replace(/<[^>]+>/g, "").trim();
-      images = (d.assets || [])
-        .filter((a) => a.has_image && a.image_url)
-        .map((a) => a.image_url);
-    } catch {}
-    if (!images.length && p.cover) images = [p.cover.thumb_url || p.cover.small_square_url].filter(Boolean);
+    return mapLimit(projects, 5, async (p) => {
+      let images = [];
+      let desc = "";
+      try {
+        const d = await get(`https://www.artstation.com/projects/${p.hash_id}.json`, true);
+        desc = (d.description_html || d.description || "").replace(/<[^>]+>/g, "").trim();
+        images = (d.assets || [])
+          .filter((a) => a.has_image && a.image_url)
+          .map((a) => a.image_url);
+      } catch {}
+      if (!images.length && p.cover) images = [p.cover.thumb_url || p.cover.small_square_url].filter(Boolean);
 
-    return {
-      id: p.hash_id || String(p.id),
-      title: p.title || "Untitled",
-      year: (p.published_at || p.created_at || "").slice(0, 4),
-      tags: (p.categories || []).map((c) => c.name).join(" / "),
-      desc,
-      link: p.permalink || `https://www.artstation.com/${ARTSTATION_USER}`,
-      images,
-    };
-  });
+      return {
+        id: p.hash_id || String(p.id),
+        title: p.title || "Untitled",
+        year: (p.published_at || p.created_at || "").slice(0, 4),
+        tags: (p.categories || []).map((c) => c.name).join(" / "),
+        desc,
+        link: p.permalink || `https://www.artstation.com/${ARTSTATION_USER}`,
+        images,
+      };
+    });
+  } catch {
+    // Blocked — fall back to the manual list so the section isn't empty.
+    return ARTSTATION_MANUAL;
+  }
 }
 
-/* ---------------- Behance ---------------- */
+/* ---------------- Behance ----------------
+   Behance's project-detail pages return bot-detection errors even from a
+   plain server-side fetch, so this only makes ONE request (the profile
+   page) and reads titles / covers / links straight out of its HTML. That
+   HTML is not treated as trusted markup — everything pulled from it is
+   plain text and URLs, nothing is executed or rendered as-is. */
 
-function behanceState(html) {
-  // Behance embeds its page data in a script tag; shape changes over time,
-  // so try the known ids first, then any large JSON blob.
-  const patterns = [
-    /<script[^>]*id="beconfig-store_state"[^>]*>([\s\S]*?)<\/script>/,
-    /<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/,
-    /window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});?\s*<\/script>/,
-  ];
-  for (const re of patterns) {
-    const m = html.match(re);
-    if (m) { try { return JSON.parse(m[1]); } catch {} }
+function scrapeBehanceProfile(html) {
+  const posts = [];
+  const seen = new Set();
+  const linkRe = /href="(https:\/\/www\.behance\.net\/gallery\/(\d+)\/([^"?]+))"[^>]*title="Link to project - ([^"]+)"/g;
+  let m;
+  while ((m = linkRe.exec(html))) {
+    const [, link, id, slug, titleRaw] = m;
+    if (seen.has(id)) continue;
+    seen.add(id);
+
+    // nearest preceding cover image
+    const windowStart = Math.max(0, m.index - 2000);
+    const chunk = html.slice(windowStart, m.index);
+    const imgs = [...chunk.matchAll(/<img[^>]+src="(https:\/\/mir-s3-cdn-cf\.behance\.net\/[^"]+)"/g)];
+    const cover = imgs.length ? imgs[imgs.length - 1][1] : null;
+
+    posts.push({
+      id,
+      title: decodeHtmlEntities(titleRaw),
+      year: "",
+      tags: "",
+      desc: "",
+      link,
+      images: cover ? [cover] : [],
+    });
   }
-  return null;
+  return posts;
+}
+
+function decodeHtmlEntities(s) {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
 }
 
 async function behance() {
   const html = await get(`https://www.behance.net/${BEHANCE_USER}`);
-  const state = behanceState(html);
-  if (!state) return [];
-
-  // A project object on Behance has a name/slug and a covers map.
-  const raw = deepFind(state, (o) =>
-    o && typeof o.name === "string" && o.covers && (o.url || o.slug || o.id)
-  ).slice(0, MAX_PROJECTS);
-
-  const seen = new Set();
-  const unique = raw.filter((p) => {
-    const k = String(p.id || p.url || p.name);
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-
-  return mapLimit(unique, 4, async (p) => {
-    const link = p.url || `https://www.behance.net/gallery/${p.id}/${p.slug || ""}`;
-    let images = [bestCover(p.covers)].filter(Boolean);
-    let desc = p.description || "";
-
-    try {
-      const ph = await get(link);
-      const ps = behanceState(ph);
-      if (ps) {
-        const modules = deepFind(ps, (o) => o && (o.imageSizes || o.sizes) && (o.type === "image" || o.src || o.imageSizes));
-        const urls = modules
-          .map((m) => {
-            const s = m.imageSizes || m.sizes || {};
-            return s.original?.url || s.max_1920?.url || s.disp?.url || s.original || s.max_1920 || m.src || null;
-          })
-          .filter((u) => typeof u === "string");
-        if (urls.length) images = [...new Set(urls)];
-      }
-      if (!desc) {
-        const og = ph.match(/<meta property="og:description" content="([^"]*)"/);
-        if (og) desc = og[1];
-      }
-    } catch {}
-
-    return {
-      id: String(p.id || p.slug || p.name).replace(/\W+/g, "-").toLowerCase(),
-      title: p.name,
-      year: p.published_on ? new Date(p.published_on * 1000).getFullYear().toString() : "",
-      tags: (p.fields || []).map((f) => (typeof f === "string" ? f : f.name)).join(" / "),
-      desc,
-      link,
-      images,
-    };
-  });
+  return scrapeBehanceProfile(html).slice(0, MAX_PROJECTS);
 }
 
 /* ---------------- handler ---------------- */
